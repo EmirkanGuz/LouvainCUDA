@@ -7,26 +7,34 @@
 #include <chrono>
 
 #define THREADS_PER_BLOCK 256
+const int MAX_ITERATIONS = 1000;
 
-__global__ void computeModularityGain(int *row_ptr, int *col_idx, int *community, int numNodes) {
+
+__global__ void computeModularityGain(int *row_ptr, int *col_idx, int *community, int numNodes, int *changed) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= numNodes) return;
 
-    int bestCommunity = community[tid];
+    int currentComm = community[tid];
+    int bestCommunity = currentComm;
     float bestGain = 0.0f;
 
     for (int i = row_ptr[tid]; i < row_ptr[tid + 1]; i++) {
         int neighbor = col_idx[i];
         int newCommunity = community[neighbor];
 
-        float gain = 0.1f * (newCommunity != bestCommunity);
+        float gain = 0.1f * (newCommunity != currentComm); // Dummy gain logic
         if (gain > bestGain) {
             bestGain = gain;
             bestCommunity = newCommunity;
         }
     }
-    community[tid] = bestCommunity;
+
+    if (bestCommunity != currentComm) {
+        community[tid] = bestCommunity;
+        atomicExch(changed, 1); // Mark change
+    }
 }
+
 
 __global__ void aggregate_communities(int *row_ptr, int *col_idx, int *d_comm, float *d_weights, int numNodes) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -76,38 +84,52 @@ void loadGraphCSR(const std::string &filename, std::vector<int> &row_ptr, std::v
 }
 
 void louvainCUDA(std::vector<int> &row_ptr, std::vector<int> &col_idx, std::vector<int> &communities, int numNodes) {
-    int *d_row_ptr, *d_col_idx, *d_community;
+    int *d_row_ptr, *d_col_idx, *d_community, *d_changed;
+    int blocks = (numNodes + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
 
     cudaMalloc(&d_row_ptr, (numNodes + 1) * sizeof(int));
     cudaMalloc(&d_col_idx, col_idx.size() * sizeof(int));
     cudaMalloc(&d_community, numNodes * sizeof(int));
+    cudaMalloc(&d_changed, sizeof(int));
 
     cudaMemcpy(d_row_ptr, row_ptr.data(), (numNodes + 1) * sizeof(int), cudaMemcpyHostToDevice);
     cudaMemcpy(d_col_idx, col_idx.data(), col_idx.size() * sizeof(int), cudaMemcpyHostToDevice);
     cudaMemcpy(d_community, communities.data(), numNodes * sizeof(int), cudaMemcpyHostToDevice);
 
-    int blocks = (numNodes + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+    int h_changed;
 
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
     cudaEventRecord(start, 0);
 
-    computeModularityGain<<<blocks, THREADS_PER_BLOCK>>>(d_row_ptr, d_col_idx, d_community, numNodes);
-    cudaDeviceSynchronize();
+    int iteration = 0;
+    do {
+        h_changed = 0;
+        cudaMemcpy(d_changed, &h_changed, sizeof(int), cudaMemcpyHostToDevice);
+
+        computeModularityGain<<<blocks, THREADS_PER_BLOCK>>>(d_row_ptr, d_col_idx, d_community, numNodes, d_changed);
+        cudaDeviceSynchronize();
+
+        cudaMemcpy(&h_changed, d_changed, sizeof(int), cudaMemcpyDeviceToHost);
+        iteration++;
+
+    } while (h_changed != 0 && iteration < MAX_ITERATIONS);
+
 
     cudaEventRecord(stop, 0);
     cudaEventSynchronize(stop);
     float milliseconds = 0;
     cudaEventElapsedTime(&milliseconds, start, stop);
 
+    std::cout << "CUDA Louvain loop executed in " << iteration << " iterations, time: " << milliseconds << " ms\n";
+
     cudaMemcpy(communities.data(), d_community, numNodes * sizeof(int), cudaMemcpyDeviceToHost);
 
     cudaFree(d_row_ptr);
     cudaFree(d_col_idx);
     cudaFree(d_community);
-
-    std::cout << "CUDA Louvain execution time: " << milliseconds << " ms\n";
+    cudaFree(d_changed);
 }
 
 int main() {
@@ -153,23 +175,22 @@ int main() {
 
     cudaMemcpy(communities.data(), d_comm, numNodes * sizeof(int), cudaMemcpyDeviceToHost);
 
-    std::cout << "Updated communities (first 10 nodes):\n";
-    for (int i = 0; i < 10; i++) {
-        std::cout << "Node " << i << " -> Community " << communities[i] << "\n";
-    }
-
-    std::cout << "Phase 2: Printing community weights...\n";
-
     std::vector<float> h_weights_out(numNodes);
 
     cudaDeviceSynchronize();
     cudaMemcpy(h_weights_out.data(), d_weights, numNodes * sizeof(float), cudaMemcpyDeviceToHost);
     
     std::cout << "Community weights (first 100):\n";
-    for (int i = 0; i < 100; i++) {
-        std::cout << "Community " << i << " has total weight: " << h_weights_out[i] << "\n";
+    int i = 0;
+    int j = 0;
+    int arraySize = sizeof(h_weights_out) / sizeof(h_weights_out[0]);
+    while (j < 100 && i < arraySize) {
+        if (h_weights_out[i] != 0) {
+            std::cout << "Community " << i << " has total weight: " << h_weights_out[i] << "\n";
+            j++;
+        }
+        i++;
     }
-
     cudaFree(d_weights);
     cudaFree(d_newGraph);
     cudaFree(d_comm);
