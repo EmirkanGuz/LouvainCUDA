@@ -5,12 +5,30 @@
 #include <sstream>
 #include <unordered_map>
 #include <chrono>
+#include <algorithm>
 
 #define THREADS_PER_BLOCK 256
 const int MAX_ITERATIONS = 1000;
+const float MIN_MODULARITY_GAIN = 1e-5f;
+const float RESOLUTION = 0.8f;
 
+struct Graph {
+    std::vector<int> row_ptr;
+    std::vector<int> col_idx;
+    int numNodes;
+    float totalEdgeWeight;
+};
 
-__global__ void computeModularityGain(int *row_ptr, int *col_idx, int *community, int numNodes, int *changed) {
+__global__ void initializeCommunities(int* communities, int numNodes) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid < numNodes) {
+        communities[tid] = tid;
+    }
+}
+
+__global__ void computeModularityGain(int* row_ptr, int* col_idx, int* community, 
+                                     int numNodes, int* changed, float* modularityGain,
+                                     float totalEdgeWeight, float resolution) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= numNodes) return;
 
@@ -18,43 +36,83 @@ __global__ void computeModularityGain(int *row_ptr, int *col_idx, int *community
     int bestCommunity = currentComm;
     float bestGain = 0.0f;
 
+    float nodeDegree = row_ptr[tid+1] - row_ptr[tid];
+
+    float currentMod = 0.0f;
+    for (int i = row_ptr[tid]; i < row_ptr[tid + 1]; i++) {
+        if (community[col_idx[i]] == currentComm) {
+            currentMod += 1.0f;
+        }
+    }
+    currentMod -= resolution * (nodeDegree * nodeDegree) / (2.0f * totalEdgeWeight);
+
     for (int i = row_ptr[tid]; i < row_ptr[tid + 1]; i++) {
         int neighbor = col_idx[i];
         int newCommunity = community[neighbor];
+        if (newCommunity == currentComm) continue;
 
-        float gain = 0.1f * (newCommunity != currentComm); // Dummy gain logic
+        float newMod = 0.0f;
+        for (int j = row_ptr[tid]; j < row_ptr[tid + 1]; j++) {
+            if (community[col_idx[j]] == newCommunity) {
+                newMod += 1.0f;
+            }
+        }
+        newMod -= resolution * (nodeDegree * nodeDegree) / (2.0f * totalEdgeWeight);
+
+        float gain = newMod - currentMod;
         if (gain > bestGain) {
             bestGain = gain;
             bestCommunity = newCommunity;
         }
     }
 
-    if (bestCommunity != currentComm) {
+    if (bestGain > MIN_MODULARITY_GAIN && bestCommunity != currentComm) {
         community[tid] = bestCommunity;
-        atomicExch(changed, 1); // Mark change
+        atomicAdd(modularityGain, bestGain);
+        atomicExch(changed, 1);
     }
 }
 
-
-__global__ void aggregate_communities(int *row_ptr, int *col_idx, int *d_comm, float *d_weights, int numNodes) {
+__global__ void mergeSmallCommunities(int* row_ptr, int* col_idx, int* community, 
+    int numNodes, int minCommunitySize) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
-
     if (tid >= numNodes) return;
 
-    int comm = d_comm[tid];
+    int currentComm = community[tid];
 
-    for (int i = row_ptr[tid]; i < row_ptr[tid + 1]; i++) {
-        int neighbor = col_idx[i];
-        int neighborComm = d_comm[neighbor];
+    int commSize = 0;
+    for (int i = 0; i < numNodes; i++) {
+        if (community[i] == currentComm) {
+            commSize++;
+        }
+    }
 
-        if (comm == neighborComm) {
-            atomicAdd(&d_weights[comm], 1.0f);
+    if (commSize < minCommunitySize) {
+        int maxCount = 0;
+        int largestNeighborComm = currentComm; 
+
+        const int MAX_TEMP = 100;
+        int neighborCounts[MAX_TEMP] = {0};
+
+        for (int i = row_ptr[tid]; i < row_ptr[tid + 1]; i++) {
+            int neighborComm = community[col_idx[i]];
+            if (neighborComm < MAX_TEMP) {
+                neighborCounts[neighborComm]++;
+                if (neighborCounts[neighborComm] > maxCount) {
+                    maxCount = neighborCounts[neighborComm];
+                    largestNeighborComm = neighborComm;
+                }
+            }
+        }
+
+        if (largestNeighborComm != currentComm) {
+            community[tid] = largestNeighborComm;
         }
     }
 }
 
-
-void loadGraphCSR(const std::string &filename, std::vector<int> &row_ptr, std::vector<int> &col_idx, int &numNodes) {
+Graph loadGraphCSR(const std::string& filename) {
+    Graph graph;
     std::ifstream file(filename);
     std::unordered_map<int, std::vector<int>> adjList;
     int maxNode = 0;
@@ -69,132 +127,140 @@ void loadGraphCSR(const std::string &filename, std::vector<int> &row_ptr, std::v
         adjList[u].push_back(v);
         adjList[v].push_back(u);
         maxNode = std::max(maxNode, std::max(u, v));
+        graph.totalEdgeWeight += 1.0f;
     }
     file.close();
 
-    numNodes = maxNode + 1;
-    row_ptr.resize(numNodes + 1, 0);
+    graph.numNodes = maxNode + 1;
+    graph.row_ptr.resize(graph.numNodes + 1, 0);
 
-    for (int i = 0; i < numNodes; i++) {
-        row_ptr[i + 1] = row_ptr[i] + adjList[i].size();
+    for (int i = 0; i < graph.numNodes; i++) {
+        graph.row_ptr[i + 1] = graph.row_ptr[i] + adjList[i].size();
     }
-    for (int i = 0; i < numNodes; i++) {
-        col_idx.insert(col_idx.end(), adjList[i].begin(), adjList[i].end());
+    for (int i = 0; i < graph.numNodes; i++) {
+        graph.col_idx.insert(graph.col_idx.end(), adjList[i].begin(), adjList[i].end());
     }
+
+    return graph;
 }
 
-void louvainCUDA(std::vector<int> &row_ptr, std::vector<int> &col_idx, std::vector<int> &communities, int numNodes) {
+void runLouvain(Graph& graph, std::vector<int>& communities) {
+
     int *d_row_ptr, *d_col_idx, *d_community, *d_changed;
-    int blocks = (numNodes + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
-
-    cudaMalloc(&d_row_ptr, (numNodes + 1) * sizeof(int));
-    cudaMalloc(&d_col_idx, col_idx.size() * sizeof(int));
-    cudaMalloc(&d_community, numNodes * sizeof(int));
+    float *d_modularityGain;
+    
+    cudaMalloc(&d_row_ptr, (graph.numNodes + 1) * sizeof(int));
+    cudaMalloc(&d_col_idx, graph.col_idx.size() * sizeof(int));
+    cudaMalloc(&d_community, graph.numNodes * sizeof(int));
     cudaMalloc(&d_changed, sizeof(int));
+    cudaMalloc(&d_modularityGain, sizeof(float));
 
-    cudaMemcpy(d_row_ptr, row_ptr.data(), (numNodes + 1) * sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_col_idx, col_idx.data(), col_idx.size() * sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_community, communities.data(), numNodes * sizeof(int), cudaMemcpyHostToDevice);
 
+    cudaMemcpy(d_row_ptr, graph.row_ptr.data(), (graph.numNodes + 1) * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_col_idx, graph.col_idx.data(), graph.col_idx.size() * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_community, communities.data(), graph.numNodes * sizeof(int), cudaMemcpyHostToDevice);
+
+    int blocks = (graph.numNodes + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
     int h_changed;
+    float h_modularityGain;
 
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
-    cudaEventRecord(start, 0);
 
     int iteration = 0;
+    float max_gain = 0.0f;
     do {
         h_changed = 0;
+        h_modularityGain = 0.0f;
+        
         cudaMemcpy(d_changed, &h_changed, sizeof(int), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_modularityGain, &h_modularityGain, sizeof(float), cudaMemcpyHostToDevice);
 
-        computeModularityGain<<<blocks, THREADS_PER_BLOCK>>>(d_row_ptr, d_col_idx, d_community, numNodes, d_changed);
+        computeModularityGain<<<blocks, THREADS_PER_BLOCK>>>(
+            d_row_ptr, d_col_idx, d_community, graph.numNodes, 
+            d_changed, d_modularityGain, graph.totalEdgeWeight, RESOLUTION);
+        
         cudaDeviceSynchronize();
 
         cudaMemcpy(&h_changed, d_changed, sizeof(int), cudaMemcpyDeviceToHost);
+        cudaMemcpy(&h_modularityGain, d_modularityGain, sizeof(float), cudaMemcpyDeviceToHost);
+
         iteration++;
+        std::cout << "Iteration " << iteration << ": Modularity gain = " 
+                  << h_modularityGain << std::endl;
 
-    } while (h_changed != 0 && iteration < MAX_ITERATIONS);
+        if (max_gain < h_modularityGain)
+            max_gain = h_modularityGain;
+        else if (h_modularityGain / max_gain < 0.001){
+            break;
+        }
 
+    } while (h_changed && iteration < MAX_ITERATIONS);
 
-    cudaEventRecord(stop, 0);
-    cudaEventSynchronize(stop);
-    float milliseconds = 0;
-    cudaEventElapsedTime(&milliseconds, start, stop);
+    mergeSmallCommunities<<<blocks, THREADS_PER_BLOCK>>>(
+        d_row_ptr, d_col_idx, d_community, graph.numNodes, 3);
+    cudaDeviceSynchronize();
 
-    std::cout << "CUDA Louvain loop executed in " << iteration << " iterations, time: " << milliseconds << " ms\n";
-
-    cudaMemcpy(communities.data(), d_community, numNodes * sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(communities.data(), d_community, graph.numNodes * sizeof(int), cudaMemcpyDeviceToHost);
 
     cudaFree(d_row_ptr);
     cudaFree(d_col_idx);
     cudaFree(d_community);
     cudaFree(d_changed);
+    cudaFree(d_modularityGain);
+}
+
+void analyzeCommunities(const std::vector<int>& communities) {
+    std::unordered_map<int, int> communitySizes;
+    for (int comm : communities) {
+        communitySizes[comm]++;
+    }
+
+    std::vector<std::pair<int, int>> sortedCommunities(communitySizes.begin(), communitySizes.end());
+    std::sort(sortedCommunities.begin(), sortedCommunities.end(),
+              [](const auto& a, const auto& b) { return a.second > b.second; });
+
+    std::cout << "\nCommunity Distribution:\n";
+    std::cout << "Total communities: " << sortedCommunities.size() << "\n";
+    
+    int topN = std::min(10, (int)sortedCommunities.size());
+    float totalNodes = communities.size();
+    float coverage = 0.0f;
+
+    for (int i = 0; i < topN; i++) {
+        float percent = 100.0f * sortedCommunities[i].second / totalNodes;
+        coverage += percent;
+        std::cout << "Community " << sortedCommunities[i].first << ": " 
+                  << sortedCommunities[i].second << " nodes (" 
+                  << percent << "%)\n";
+    }
+
+    std::cout << "Top " << topN << " communities cover " << coverage << "% of nodes\n";
+    std::cout << "Average community size: " << totalNodes / sortedCommunities.size() << "\n";
 }
 
 int main() {
-    std::string filename = "soc-LiveJournal1.txt";
-    std::vector<int> row_ptr, col_idx;
-    int numNodes;
-
     auto start = std::chrono::high_resolution_clock::now();
-    loadGraphCSR(filename, row_ptr, col_idx, numNodes);
-    auto stop = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> load_time = stop - start;
-    std::cout << "Graph loading time: " << load_time.count() << " seconds\n";
+    Graph graph = loadGraphCSR("soc-LiveJournal1.txt");
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> elapsed = end - start;
+    std::cout << "Graph loaded in " << elapsed.count() << " seconds\n";
+    std::cout << "Nodes: " << graph.numNodes << ", Edges: " << graph.col_idx.size()/2 << "\n";
 
-    std::vector<int> communities(numNodes);
-    for (int i = 0; i < numNodes; i++) {
-        communities[i] = i;
-    }
-
-    louvainCUDA(row_ptr, col_idx, communities, numNodes);
-
-    float *d_weights;
-    int *d_newGraph, *d_comm, *d_adj;
-
-    cudaMalloc(&d_weights, numNodes * sizeof(float));
-    cudaMemset(d_weights, 0, numNodes * sizeof(float));
-    cudaMalloc(&d_newGraph, numNodes * numNodes * sizeof(int));
-    cudaMalloc(&d_comm, numNodes * sizeof(int));
-    cudaMalloc(&d_adj, col_idx.size() * sizeof(int));
-
-    cudaMemcpy(d_comm, communities.data(), numNodes * sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_adj, col_idx.data(), col_idx.size() * sizeof(int), cudaMemcpyHostToDevice);
-
-    int blocks = (numNodes + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+    std::vector<int> communities(graph.numNodes);
+    int blocks = (graph.numNodes + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
     
-    int *d_row_ptr, *d_col_idx;
-    cudaMalloc(&d_row_ptr, (numNodes + 1) * sizeof(int));
-    cudaMalloc(&d_col_idx, col_idx.size() * sizeof(int));
-    cudaMemcpy(d_row_ptr, row_ptr.data(), (numNodes + 1) * sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_col_idx, col_idx.data(), col_idx.size() * sizeof(int), cudaMemcpyHostToDevice);
+    int* d_communities;
+    cudaMalloc(&d_communities, graph.numNodes * sizeof(int));
+    initializeCommunities<<<blocks, THREADS_PER_BLOCK>>>(d_communities, graph.numNodes);
+    cudaMemcpy(communities.data(), d_communities, graph.numNodes * sizeof(int), cudaMemcpyDeviceToHost);
+    cudaFree(d_communities);
 
-    aggregate_communities<<<blocks, THREADS_PER_BLOCK>>>(d_row_ptr, d_col_idx, d_comm, d_weights, numNodes);
-    cudaDeviceSynchronize();
+    start = std::chrono::high_resolution_clock::now();
+    runLouvain(graph, communities);
+    end = std::chrono::high_resolution_clock::now();
+    elapsed = end - start;
+    std::cout << "Louvain completed in " << elapsed.count() << " seconds\n";
 
-    cudaMemcpy(communities.data(), d_comm, numNodes * sizeof(int), cudaMemcpyDeviceToHost);
+    analyzeCommunities(communities);
 
-    std::vector<float> h_weights_out(numNodes);
-
-    cudaDeviceSynchronize();
-    cudaMemcpy(h_weights_out.data(), d_weights, numNodes * sizeof(float), cudaMemcpyDeviceToHost);
-    
-    std::cout << "Community weights (first 100):\n";
-    int i = 0;
-    int j = 0;
-    int arraySize = sizeof(h_weights_out) / sizeof(h_weights_out[0]);
-    while (j < 100 && i < arraySize) {
-        if (h_weights_out[i] != 0) {
-            std::cout << "Community " << i << " has total weight: " << h_weights_out[i] << "\n";
-            j++;
-        }
-        i++;
-    }
-    cudaFree(d_weights);
-    cudaFree(d_newGraph);
-    cudaFree(d_comm);
-    cudaFree(d_adj);
-    
     return 0;
 }
