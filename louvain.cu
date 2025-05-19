@@ -338,7 +338,7 @@ void analyzeCommunities(const std::vector<int>& communities) {
 
 int main() {
     auto start = std::chrono::high_resolution_clock::now();
-    Graph graph = loadGraphCSR("email-Eu-core.txt");
+    Graph graph = loadGraphCSR("soc-LiveJournal1.txt");
     auto end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> elapsed = end - start;
     std::cout << "Graph loaded in " << elapsed.count() << " seconds\n";
